@@ -115,6 +115,21 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
       (fileId, errStr) => {
         updateTransfer(fileId, { status: "error", speed: 0 });
         console.error("Transfer error:", errStr);
+      },
+      // onReceiveHeader
+      (metadata) => {
+        setActiveTransfers((prev) => [
+          ...prev,
+          {
+            id: metadata.fileId,
+            name: metadata.name,
+            size: metadata.size,
+            transferred: 0,
+            status: "receiving",
+            speed: 0,
+            startTime: performance.now(),
+          },
+        ]);
       }
     );
     fileTransferRef.current = ftm;
@@ -123,34 +138,8 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
     const rtc = new WebRTCManager(
       (data) => sigClientRef.current?.send(data),
       {
-        onDataChannel: (_peerId, channel) => {
-          channel.onmessage = (event) => {
-            ftm.handleIncomingData(event.data, channel);
-
-            // Register incoming file in UI
-            if (typeof event.data === "string") {
-              try {
-                const msg = JSON.parse(event.data);
-                if (msg.type === "header") {
-                  const m = msg.metadata as TransferMetadata;
-                  setActiveTransfers((prev) => [
-                    ...prev,
-                    {
-                      id: m.fileId,
-                      name: m.name,
-                      size: m.size,
-                      transferred: 0,
-                      status: "receiving",
-                      speed: 0,
-                      startTime: performance.now(),
-                    },
-                  ]);
-                } else if (msg.type === "cancel") {
-                  updateTransfer(msg.fileId, { status: "cancelled", speed: 0 });
-                }
-              } catch (_e) {}
-            }
-          };
+        onDataChannel: (peerId, channel) => {
+          ftm.registerChannel(peerId, channel);
         },
         onConnectionStateChange: (peerId, state) => {
           setPeers((prev) =>
@@ -161,6 +150,7 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
         },
       }
     );
+    ftm.setWebRTCManager(rtc);
     rtcManagerRef.current = rtc;
 
     // 3. Signaling Client
@@ -237,24 +227,21 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
       ]);
 
       connectedPeerIds.forEach((peerId) => {
-        const dc = rtc.getDataChannel(peerId);
-        if (dc && dc.readyState === "open") {
-          ftm
-            .sendFile(file, dc, (fId, bytes, speedBps) => {
-              updateTransfer(fId, { transferred: bytes, speed: speedBps });
-              if (bytes >= file.size) {
-                updateTransfer(fId, { status: "complete", speed: 0 });
-              }
-            }, controller)
-            .catch((err) => {
-              const msg = (err as Error).message;
-              if (msg === "Transfer cancelled") {
-                updateTransfer(fileId, { status: "cancelled", speed: 0 });
-              } else {
-                updateTransfer(fileId, { status: "error", speed: 0 });
-              }
-            });
-        }
+        ftm
+          .sendFile(file, peerId, (fId, bytes, speedBps) => {
+            updateTransfer(fId, { transferred: bytes, speed: speedBps });
+            if (bytes >= file.size) {
+              updateTransfer(fId, { status: "complete", speed: 0 });
+            }
+          }, controller)
+          .catch((err) => {
+            const msg = (err as Error).message;
+            if (msg === "Transfer cancelled") {
+              updateTransfer(fileId, { status: "cancelled", speed: 0 });
+            } else {
+              updateTransfer(fileId, { status: "error", speed: 0 });
+            }
+          });
       });
     });
   };

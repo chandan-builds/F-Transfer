@@ -7,19 +7,19 @@ export type PeerEvents = {
 // Configuration with STUN and placeholder TURN for robust ICE gathering across network boundaries
 export const rtcConfig: RTCConfiguration = {
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { 
-      urls: 'turn:placeholder.turn.server:3478', 
-      username: 'turnuser', 
-      credential: 'turnpassword' 
-    }
-  ]
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    {
+      urls: "turn:placeholder.turn.server:3478",
+      username: "turnuser",
+      credential: "turnpassword",
+    },
+  ],
 };
 
 export class WebRTCManager {
   private peers: Map<string, RTCPeerConnection> = new Map();
-  private dataChannels: Map<string, RTCDataChannel> = new Map();
+  private dataChannels: Map<string, RTCDataChannel[]> = new Map();
   private events: PeerEvents;
   private signalFunc: (data: any) => void;
 
@@ -32,8 +32,12 @@ export class WebRTCManager {
     this.events = events;
   }
 
-  getDataChannel(peerId: string): RTCDataChannel | undefined {
-    return this.dataChannels.get(peerId);
+  getPeerConnection(peerId: string): RTCPeerConnection | undefined {
+    return this.peers.get(peerId);
+  }
+
+  getDataChannels(peerId: string): RTCDataChannel[] {
+    return this.dataChannels.get(peerId) || [];
   }
 
   async connectToPeer(peerId: string): Promise<void> {
@@ -41,22 +45,22 @@ export class WebRTCManager {
 
     const pc = this.createPeerConnection(peerId);
 
-    // Create reliable, ordered data channel for file transfer with maxRetransmits
-    // Enforcing SCTP limits for robust P2P transmission
-    const dataChannel = pc.createDataChannel('f-transfer-data', {
-      ordered: true,
-      maxRetransmits: 30,
-    });
-
-    this.setupDataChannel(peerId, dataChannel);
+    // Create 4 parallel datachannels for high concurrency and bandwidth saturation
+    for (let i = 0; i < 4; i++) {
+      const dataChannel = pc.createDataChannel(`f-transfer-data-${i}`, {
+        ordered: true,
+        maxRetransmits: 30, // 30 retries allows TCP-lite packet recovery over dropping lines
+      });
+      this.setupDataChannel(peerId, dataChannel);
+    }
 
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       this.signalFunc({
-        type: 'offer',
+        type: "offer",
         targetId: peerId,
-        sdp: pc.localDescription
+        sdp: pc.localDescription,
       });
     } catch (err) {
       console.error(`[WebRTC - ${peerId}] Error creating offer:`, err);
@@ -68,7 +72,7 @@ export class WebRTCManager {
 
     let pc = this.peers.get(sourceId);
 
-    if (type === 'offer') {
+    if (type === "offer") {
       if (!pc) {
         pc = this.createPeerConnection(sourceId);
       }
@@ -80,14 +84,14 @@ export class WebRTCManager {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         this.signalFunc({
-          type: 'answer',
+          type: "answer",
           targetId: sourceId,
-          sdp: pc.localDescription
+          sdp: pc.localDescription,
         });
       } catch (err) {
         console.error(`[WebRTC - ${sourceId}] Error handling offer:`, err);
       }
-    } else if (type === 'answer') {
+    } else if (type === "answer") {
       if (pc) {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(sdp));
@@ -97,12 +101,15 @@ export class WebRTCManager {
           console.error(`[WebRTC - ${sourceId}] Error handling answer:`, err);
         }
       }
-    } else if (type === 'ice-candidate') {
+    } else if (type === "ice-candidate") {
       if (pc && this.isRemoteSet.get(sourceId)) {
         try {
           await pc.addIceCandidate(new RTCIceCandidate(candidate));
         } catch (err) {
-          console.error(`[WebRTC - ${sourceId}] Error adding ICE candidate:`, err);
+          console.error(
+            `[WebRTC - ${sourceId}] Error adding ICE candidate:`,
+            err
+          );
         }
       } else {
         // Queue candidate to avoid StateMachine errors
@@ -121,7 +128,10 @@ export class WebRTCManager {
         try {
           await pc.addIceCandidate(new RTCIceCandidate(candidate));
         } catch (err) {
-          console.error(`[WebRTC - ${peerId}] Error adding queued ICE candidate:`, err);
+          console.error(
+            `[WebRTC - ${peerId}] Error adding queued ICE candidate:`,
+            err
+          );
         }
       }
       this.candidateQueue.set(peerId, []);
@@ -132,29 +142,43 @@ export class WebRTCManager {
     const pc = new RTCPeerConnection(rtcConfig);
     this.peers.set(peerId, pc);
     this.isRemoteSet.set(peerId, false);
+    this.dataChannels.set(peerId, []);
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         this.signalFunc({
-          type: 'ice-candidate',
+          type: "ice-candidate",
           targetId: peerId,
-          candidate: event.candidate
+          candidate: event.candidate,
         });
       }
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log(`[WebRTC - ${peerId}] ICE Connection State:`, pc.iceConnectionState);
+      console.log(
+        `[WebRTC - ${peerId}] ICE Connection State:`,
+        pc.iceConnectionState
+      );
     };
-    
+
     pc.onsignalingstatechange = () => {
-      console.log(`[WebRTC - ${peerId}] Signaling State:`, pc.signalingState);
+      console.log(
+        `[WebRTC - ${peerId}] Signaling State:`,
+        pc.signalingState
+      );
     };
 
     pc.onconnectionstatechange = () => {
-      console.log(`[WebRTC - ${peerId}] Connection State:`, pc.connectionState);
+      console.log(
+        `[WebRTC - ${peerId}] Connection State:`,
+        pc.connectionState
+      );
       this.events.onConnectionStateChange(peerId, pc.connectionState);
-      if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      if (
+        pc.connectionState === "disconnected" ||
+        pc.connectionState === "failed" ||
+        pc.connectionState === "closed"
+      ) {
         this.cleanupPeer(peerId);
       }
     };
@@ -167,28 +191,38 @@ export class WebRTCManager {
   }
 
   private setupDataChannel(peerId: string, channel: RTCDataChannel) {
-    channel.binaryType = 'arraybuffer';
-    this.dataChannels.set(peerId, channel);
+    channel.binaryType = "arraybuffer";
+    const channels = this.dataChannels.get(peerId) || [];
+    if (!channels.find((c) => c.label === channel.label)) {
+      channels.push(channel);
+      this.dataChannels.set(peerId, channels);
+    }
 
     channel.onopen = () => {
-      console.log(`[DataChannel - ${peerId}] Opened`);
+      console.log(`[DataChannel - ${peerId}] Opened: ${channel.label}`);
       this.events.onDataChannel(peerId, channel);
     };
 
     channel.onclose = () => {
-      console.log(`[DataChannel - ${peerId}] Closed`);
-      this.dataChannels.delete(peerId);
+      console.log(`[DataChannel - ${peerId}] Closed: ${channel.label}`);
+      const chs = this.dataChannels.get(peerId);
+      if (chs) {
+        this.dataChannels.set(
+          peerId,
+          chs.filter((c) => c.label !== channel.label)
+        );
+      }
     };
 
     channel.onerror = (error) => {
-      console.error(`[DataChannel - ${peerId}] Error:`, error);
+      console.error(`[DataChannel - ${peerId}] Error on ${channel.label}:`, error);
     };
   }
 
   cleanupPeer(peerId: string) {
-    const dc = this.dataChannels.get(peerId);
-    if (dc) {
-      dc.close();
+    const dcs = this.dataChannels.get(peerId);
+    if (dcs) {
+      dcs.forEach((dc) => dc.close());
       this.dataChannels.delete(peerId);
     }
     const pc = this.peers.get(peerId);
@@ -201,7 +235,7 @@ export class WebRTCManager {
   }
 
   disconnectAll() {
-    Array.from(this.peers.keys()).forEach(peerId => {
+    Array.from(this.peers.keys()).forEach((peerId) => {
       this.cleanupPeer(peerId);
     });
   }

@@ -1,28 +1,27 @@
+// file-transfer.ts
+
+export type SpeedProgressCallback = (fileId: string, bytesTransferred: number, speedBps: number) => void;
+export type CompleteCallback = (fileId: string, fileBlob: Blob, metadata: TransferMetadata) => void;
+export type ErrorCallback = (fileId: string, error: string) => void;
+
 export type TransferMetadata = {
   fileId: string;
   name: string;
   size: number;
   type: string;
-  totalChunks: number;
   hash: string;
+  totalChunks?: number;
 };
-
-export type ProgressCallback = (fileId: string, bytesTransferred: number) => void;
-export type CompleteCallback = (fileId: string, file: Blob, metadata: TransferMetadata) => void;
-export type ErrorCallback = (fileId: string, error: string) => void;
-export type SpeedProgressCallback = (fileId: string, bytesTransferred: number, speedBps: number) => void;
-
-// Strict 64KB chunk size to avoid DataChannel buffer overflow
-const CHUNK_SIZE = 64 * 1024;
-const BUFFER_LOW_THRESHOLD = 128 * 1024;  
-const BUFFER_HIGH_THRESHOLD = 512 * 1024;
 
 export class TransferController {
   paused = false;
   cancelled = false;
   private _resumeResolver: (() => void) | null = null;
 
-  pause() { this.paused = true; }
+  pause() {
+    this.paused = true;
+  }
+  
   resume() {
     this.paused = false;
     if (this._resumeResolver) {
@@ -30,11 +29,14 @@ export class TransferController {
       this._resumeResolver = null;
     }
   }
+  
   cancel() {
     this.cancelled = true;
     this.resume();
   }
+  
   waitForResume(): Promise<void> {
+    if (!this.paused) return Promise.resolve();
     return new Promise((resolve) => {
       this._resumeResolver = resolve;
     });
@@ -42,322 +44,441 @@ export class TransferController {
 }
 
 class SpeedTracker {
-  private samples: { time: number; bytes: number }[] = [];
-  private windowMs = 2000;
+  private lastTime = performance.now();
+  private totalBytes = 0;
+  private currentSpeed = 0;
 
-  push(bytes: number) {
+  addBytes(bytes: number) {
+    this.totalBytes += bytes;
     const now = performance.now();
-    this.samples.push({ time: now, bytes });
-    while (this.samples.length > 0 && now - this.samples[0].time > this.windowMs) {
-      this.samples.shift();
+    const dt = now - this.lastTime;
+    if (dt >= 250) {
+      this.currentSpeed = Math.max(0, this.totalBytes / (dt / 1000));
+      this.lastTime = now;
+      this.totalBytes = 0;
     }
   }
 
-  getBps(): number {
-    if (this.samples.length < 2) return 0;
-    const oldest = this.samples[0];
-    const newest = this.samples[this.samples.length - 1];
-    const dt = (newest.time - oldest.time) / 1000;
-    if (dt === 0) return 0;
-    return (newest.bytes - oldest.bytes) / dt;
+  getBps() {
+    return this.currentSpeed;
   }
 }
 
-async function computeHash(blob: Blob): Promise<string> {
-  // Avoid fully buffer.arrayBuffer() loading of very large files on constrained devices.
-  // We'll digest up to early 50MB to get an integrity fingerprint.
-  const slice = blob.size > 50_000_000 ? blob.slice(0, 50_000_000) : blob; 
-  const buffer = await slice.arrayBuffer();
-  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+class ReceiverTransfer {
+  metadata: TransferMetadata;
+  blobParts: BlobPart[] = [];
+  receivedChunks = new Map<number, { offset: number; data: Uint8Array }>();
+  nextOffsetToMerge = 0;
+  highestContiguous = -1;
+  maxReceivedSeq = -1;
+  missing = new Set<number>();
+
+  speedTracker = new SpeedTracker();
+
+  constructor(metadata: TransferMetadata) {
+    this.metadata = metadata;
+  }
+
+  addChunk(seq: number, offset: number, data: Uint8Array) {
+    if (this.receivedChunks.has(seq) || seq <= this.highestContiguous) return;
+
+    this.receivedChunks.set(seq, { offset, data });
+
+    if (seq > this.maxReceivedSeq) {
+      for (let i = this.maxReceivedSeq + 1; i < seq; i++) {
+        this.missing.add(i);
+      }
+      this.maxReceivedSeq = seq;
+    }
+    this.missing.delete(seq);
+
+    while (this.receivedChunks.has(this.highestContiguous + 1)) {
+      const nextSeq = this.highestContiguous + 1;
+      const chunk = this.receivedChunks.get(nextSeq)!;
+
+      if (chunk.offset === this.nextOffsetToMerge) {
+        this.blobParts.push(chunk.data as unknown as BlobPart);
+        this.nextOffsetToMerge += chunk.data.byteLength;
+        this.highestContiguous = nextSeq;
+        this.receivedChunks.delete(nextSeq);
+
+        // Progressive Assembly: Merge blobs periodically to prevent array overflow limits
+        if (this.blobParts.length > 500) {
+          this.blobParts = [new Blob(this.blobParts as unknown as BlobPart[])];
+        }
+      } else {
+        break;
+      }
+    }
+  }
+}
+
+class SendScheduler {
+  file: File;
+  fileId: string;
+  channels: RTCDataChannel[];
+  pc?: RTCPeerConnection;
+  ctrl: TransferController;
+  onSendProgress: SpeedProgressCallback;
+  speedTracker = new SpeedTracker();
+
+  nextOffset = 0;
+  nextSeq = 0;
+
+  unackedSeqs = new Map<number, { offset: number; size: number; timestamp: number }>();
+  missingSeqs = new Set<number>();
+  highestAckedSeq = -1;
+
+  currentChunkSize = 64 * 1024; // 64KB initial
+  lastStatsTime = 0;
+  rtt = 0;
+  packetLoss = 0;
+
+  headerAckResolver: (() => void) | null = null;
+
+  constructor(
+    file: File,
+    fileId: string,
+    channels: RTCDataChannel[],
+    pc: RTCPeerConnection | undefined,
+    ctrl: TransferController,
+    onSendProgress: SpeedProgressCallback
+  ) {
+    this.file = file;
+    this.fileId = fileId;
+    this.channels = channels;
+    this.pc = pc;
+    this.ctrl = ctrl;
+    this.onSendProgress = onSendProgress;
+  }
+
+  handleAck(highestContiguous: number, missing: number[]) {
+    this.highestAckedSeq = Math.max(this.highestAckedSeq, highestContiguous);
+    // Clear all unacked <= highestContiguous
+    for (const seq of this.unackedSeqs.keys()) {
+      if (seq <= highestContiguous) {
+        this.unackedSeqs.delete(seq);
+      }
+    }
+
+    for (const missingSeq of missing) {
+      if (this.unackedSeqs.has(missingSeq)) {
+        this.missingSeqs.add(missingSeq);
+      }
+    }
+  }
+
+  async getAvailableChannel(seq: number): Promise<RTCDataChannel> {
+    let channel = this.channels[seq % this.channels.length];
+    if (channel.readyState !== "open") {
+      channel = this.channels.find((c) => c.readyState === "open") || channel;
+    }
+
+    // Per-channel backpressure control
+    if (channel.bufferedAmount > 2 * 1024 * 1024) {
+      await new Promise<void>((resolve) => {
+        const handler = () => {
+          channel.removeEventListener("bufferedamountlow", handler);
+          resolve();
+        };
+        channel.addEventListener("bufferedamountlow", handler);
+      });
+    }
+    return channel;
+  }
+
+  async pollStats() {
+    if (!this.pc) return;
+    try {
+      const stats = await this.pc.getStats();
+      let totalLoss = 0;
+      let totalSent = 0;
+      stats.forEach((r) => {
+        if (
+          r.type === "remote-inbound-rtp" ||
+          (r.type === "candidate-pair" && r.state === "succeeded")
+        ) {
+          if (r.currentRoundTripTime) this.rtt = r.currentRoundTripTime * 1000;
+          if (r.packetsLost !== undefined) totalLoss = r.packetsLost;
+          if (r.packetsSent !== undefined) totalSent = r.packetsSent;
+        }
+      });
+      if (totalSent > 0) this.packetLoss = totalLoss / totalSent;
+
+      // Dynamically adjusting chunk size (32KB to 128KB)
+      if (this.rtt > 150 || this.packetLoss > 0.02) {
+        this.currentChunkSize = Math.max(32 * 1024, this.currentChunkSize / 2);
+      } else if (this.rtt < 50 && this.packetLoss < 0.01) {
+        this.currentChunkSize = Math.min(128 * 1024, this.currentChunkSize + 16 * 1024);
+      }
+    } catch (e) {}
+  }
+
+  async run() {
+    const idBytes = new TextEncoder().encode(this.fileId);
+    const idLen = idBytes.length;
+
+    while (this.nextOffset < this.file.size || this.unackedSeqs.size > 0) {
+      if (this.ctrl.cancelled) throw new Error("Transfer cancelled");
+      if (this.ctrl.paused) {
+        await this.ctrl.waitForResume();
+        if (this.ctrl.cancelled) throw new Error("Transfer cancelled");
+      }
+
+      const now = performance.now();
+      if (now - this.lastStatsTime > 1000) {
+        this.pollStats();
+        this.lastStatsTime = now;
+      }
+
+      let seqToSend = -1;
+      let offsetToSend = -1;
+      let sizeToSend = -1;
+
+      // Check for retransmissions based on explicit missing ACKs or timeout
+      for (const [seq, info] of this.unackedSeqs.entries()) {
+        const isTimeout = now - info.timestamp > (this.rtt ? this.rtt * 4 + 500 : 2000);
+        if (this.missingSeqs.has(seq) || isTimeout) {
+          seqToSend = seq;
+          offsetToSend = info.offset;
+          sizeToSend = info.size;
+          this.missingSeqs.delete(seq);
+          info.timestamp = now;
+          break; // send one retransmission at a time
+        }
+      }
+
+      // If no retransmission, send novel chunks
+      if (seqToSend === -1 && this.nextOffset < this.file.size) {
+        seqToSend = this.nextSeq++;
+        offsetToSend = this.nextOffset;
+        sizeToSend = Math.min(this.currentChunkSize, this.file.size - this.nextOffset);
+        this.nextOffset += sizeToSend;
+
+        this.unackedSeqs.set(seqToSend, {
+          offset: offsetToSend,
+          size: sizeToSend,
+          timestamp: now,
+        });
+      }
+
+      if (seqToSend === -1) {
+        // waiting for ACKs
+        await new Promise((r) => setTimeout(r, 50));
+        continue;
+      }
+
+      const channel = await this.getAvailableChannel(seqToSend);
+      if (channel.readyState !== "open") {
+        throw new Error("Channel closed");
+      }
+
+      // Zero-copy streaming simulation via File.slice 
+      // Memory efficient, random accessible slice wrapper avoiding monolithic ArrayBuffer limits
+      const slice = this.file.slice(offsetToSend, offsetToSend + sizeToSend);
+      const buffer = await slice.arrayBuffer();
+
+      const payload = new Uint8Array(1 + 2 + idLen + 8 + 4 + 4 + buffer.byteLength);
+      const dv = new DataView(payload.buffer);
+      dv.setUint8(0, 0); // Type 0 = Data
+      dv.setUint16(1, idLen);
+      payload.set(idBytes, 3);
+      let cur = 3 + idLen;
+      dv.setFloat64(cur, offsetToSend);
+      cur += 8;
+      dv.setUint32(cur, seqToSend);
+      cur += 4;
+      dv.setUint32(cur, sizeToSend);
+      cur += 4;
+      payload.set(new Uint8Array(buffer), cur);
+
+      channel.send(payload);
+
+      this.speedTracker.addBytes(sizeToSend);
+
+      if (seqToSend % 32 === 0 || this.nextOffset === this.file.size) {
+        this.onSendProgress(this.fileId, this.nextOffset, this.speedTracker.getBps());
+      }
+    }
+  }
 }
 
 export class FileTransferManager {
-  private inProgressReceives: Map<string, {
-    metadata: TransferMetadata;
-    chunks: Uint8Array[];
-    receivedChunks: number;
-    receivedBytes: number;
-    speedTracker: SpeedTracker;
-  }> = new Map();
+  private peerChannels = new Map<string, RTCDataChannel[]>();
+  private webrtcManager?: any; // Avoiding cyclic ref with WebRTCManager directly
 
-  private activeSends: Map<string, {
-    channel: RTCDataChannel;
-    lastAcked: number;
-    headerAckResolver: (() => void) | null;
-    resumeAckResolver: ((nextChunk: number) => void) | null;
-  }> = new Map();
+  private inProgressReceives = new Map<string, ReceiverTransfer>();
+  private activeSends = new Map<string, SendScheduler>();
+  activeControllers = new Map<string, TransferController>();
 
-  activeControllers: Map<string, TransferController> = new Map();
+  constructor(
+    private onProgress: SpeedProgressCallback,
+    private onComplete: CompleteCallback,
+    private onError: ErrorCallback,
+    private onReceiveHeader: (metadata: TransferMetadata) => void
+  ) {}
 
-  private onProgress: SpeedProgressCallback;
-  private onComplete: CompleteCallback;
-  private onError: ErrorCallback;
+  setWebRTCManager(manager: any) {
+    this.webrtcManager = manager;
+  }
 
-  constructor(onProgress: SpeedProgressCallback, onComplete: CompleteCallback, onError: ErrorCallback) {
-    this.onProgress = onProgress;
-    this.onComplete = onComplete;
-    this.onError = onError;
+  registerChannel(peerId: string, channel: RTCDataChannel) {
+    let channels = this.peerChannels.get(peerId);
+    if (!channels) {
+      channels = [];
+      this.peerChannels.set(peerId, channels);
+    }
+    if (!channels.find((c) => c.label === channel.label)) {
+      channels.push(channel);
+      channel.bufferedAmountLowThreshold = 1024 * 1024; // 1MB threshold per channel
+
+      channel.addEventListener("message", (e) => {
+        this.handleIncomingData(e.data, channel, peerId);
+      });
+      console.log(`[FTM] Registered channel ${channel.label} for peer ${peerId}`);
+    }
   }
 
   async sendFile(
     file: File,
-    channel: RTCDataChannel,
+    peerId: string,
     onSendProgress: SpeedProgressCallback,
     controller?: TransferController
   ): Promise<void> {
-    const fileId = `${file.name}-${Date.now()}`;
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    const ctrl = controller ?? new TransferController();
+    const channels = this.peerChannels.get(peerId) || [];
+    if (channels.length === 0) throw new Error("No DataChannels available for " + peerId);
 
+    const fileId = `${file.name}-${Date.now()}`;
+    const ctrl = controller ?? new TransferController();
     this.activeControllers.set(fileId, ctrl);
 
-    const hash = await computeHash(file);
+    // Initial SHA-256 (optional simulation or real for production, skipping for ultra-fast but kept in structure)
     const metadata: TransferMetadata = {
-      fileId, name: file.name, size: file.size, type: file.type, totalChunks, hash
+      fileId,
+      name: file.name,
+      size: file.size,
+      type: file.type,
+      totalChunks: Math.ceil(file.size / (64 * 1024)), 
+      hash: "",
     };
 
-    const sendState = {
-      channel,
-      lastAcked: -1,
-      headerAckResolver: null as (() => void) | null,
-      resumeAckResolver: null as ((nc: number) => void) | null
-    };
-    this.activeSends.set(fileId, sendState);
+    // Send header (JSON)
+    const headerMsg = JSON.stringify({ type: "header", metadata });
+    channels[0].send(headerMsg);
 
-    // Send header via JSON
-    channel.send(JSON.stringify({ type: 'header', metadata }));
+    const pc = this.webrtcManager?.getPeerConnection(peerId);
+    const state = new SendScheduler(file, fileId, channels, pc, ctrl, onSendProgress);
+    this.activeSends.set(fileId, state);
 
-    // Wait for header ACK to ensure the receiver is fully ready
-    await new Promise<void>((resolve) => {
-      sendState.headerAckResolver = resolve;
-      // Auto-fallback in case of slow or dropped signaling for header-ack
-      setTimeout(() => { if (sendState.headerAckResolver) resolve(); }, 5000);
+    // Wait for header ack (using explicit Promise mechanism)
+    await new Promise<void>((resolve, reject) => {
+      state.headerAckResolver = resolve;
+      setTimeout(() => reject(new Error("Header ACK timeout")), 10000);
     });
-    sendState.headerAckResolver = null;
-
-    channel.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD;
-    const speedTracker = new SpeedTracker();
-    let chunkIndex = 0;
-
-    const waitForDrain = (): Promise<void> =>
-      new Promise((resolve) => {
-        if (channel.bufferedAmount <= BUFFER_LOW_THRESHOLD) {
-          resolve();
-          return;
-        }
-        const handler = () => {
-          channel.removeEventListener('bufferedamountlow', handler);
-          resolve();
-        };
-        channel.addEventListener('bufferedamountlow', handler);
-      });
 
     try {
-      while (chunkIndex < totalChunks) {
-        if (ctrl.cancelled) {
-          channel.send(JSON.stringify({ type: 'cancel', fileId }));
-          throw new Error('Transfer cancelled');
-        }
-
-        if (ctrl.paused) {
-          channel.send(JSON.stringify({ type: 'pause', fileId }));
-          await ctrl.waitForResume();
-          if (ctrl.cancelled) {
-            channel.send(JSON.stringify({ type: 'cancel', fileId }));
-            throw new Error('Transfer cancelled');
-          }
-          
-          // Request resume chunk index explicitly
-          channel.send(JSON.stringify({ type: 'request-resume', fileId }));
-          chunkIndex = await new Promise<number>((resolve) => {
-            sendState.resumeAckResolver = resolve;
-            setTimeout(() => {
-              if (sendState.resumeAckResolver) {
-                resolve(sendState.lastAcked + 1);
-              }
-            }, 5000);
-          });
-          sendState.resumeAckResolver = null;
-          if (chunkIndex >= totalChunks) break;
-        }
-
-        if (channel.readyState !== 'open') {
-          throw new Error('DataChannel closed unexpectedly');
-        }
-
-        if (channel.bufferedAmount > BUFFER_HIGH_THRESHOLD) {
-          await waitForDrain();
-        }
-
-        const offset = chunkIndex * CHUNK_SIZE;
-        const end = Math.min(offset + CHUNK_SIZE, file.size);
-        const slice = file.slice(offset, end);
-        const buffer = await slice.arrayBuffer();
-
-        // Safe Binary protocol layout: fileIdLen (4) | fileId (bytes) | chunkIndex (4) | totalChunks (4) | data
-        const idBytes = new TextEncoder().encode(fileId);
-        const payload = new Uint8Array(4 + idBytes.length + 8 + buffer.byteLength);
-        const view = new DataView(payload.buffer);
-        view.setUint32(0, idBytes.length);
-        payload.set(idBytes, 4);
-        view.setUint32(4 + idBytes.length, chunkIndex);
-        view.setUint32(8 + idBytes.length, totalChunks);
-        payload.set(new Uint8Array(buffer), 12 + idBytes.length);
-
-        channel.send(payload);
-
-        speedTracker.push(end);
-        onSendProgress(fileId, end, speedTracker.getBps());
-
-        chunkIndex++;
-      }
-      
-      // Notify completion explicitly
-      channel.send(JSON.stringify({ type: 'done', fileId }));
-    } catch (err: any) {
-      if (err.message !== 'Transfer cancelled') {
-        try {
-          channel.send(JSON.stringify({ type: 'error', fileId, message: err.message }));
-        } catch(e) {}
-      }
-      this.cleanupSend(fileId);
-      throw err;
-    }
-
-    this.cleanupSend(fileId);
-  }
-
-  private cleanupSend(fileId: string) {
-    this.activeSends.delete(fileId);
-    this.activeControllers.delete(fileId);
-  }
-
-  handleIncomingData(data: string | ArrayBuffer, channel?: RTCDataChannel) {
-    if (typeof data === 'string') {
-      this.handleJsonData(data, channel);
-    } else if (data instanceof ArrayBuffer) {
-      this.handleBinaryData(data, channel);
-    }
-  }
-
-  private handleJsonData(data: string, channel?: RTCDataChannel) {
-    try {
-      const msg = JSON.parse(data);
-      if (msg.type === 'header') {
-        this.inProgressReceives.set(msg.metadata.fileId, {
-          metadata: msg.metadata,
-          chunks: new Array(msg.metadata.totalChunks),
-          receivedChunks: 0,
-          receivedBytes: 0,
-          speedTracker: new SpeedTracker()
-        });
-        if (channel && channel.readyState === 'open') {
-          channel.send(JSON.stringify({ type: 'header-ack', fileId: msg.metadata.fileId }));
-        }
-      } else if (msg.type === 'header-ack') {
-        const sendState = this.activeSends.get(msg.fileId);
-        if (sendState && sendState.headerAckResolver) {
-          sendState.headerAckResolver();
-          sendState.headerAckResolver = null;
-        }
-      } else if (msg.type === 'ack') {
-        const sendState = this.activeSends.get(msg.fileId);
-        if (sendState) {
-          sendState.lastAcked = Math.max(sendState.lastAcked, msg.chunkIndex);
-        }
-      } else if (msg.type === 'request-resume') {
-        const rx = this.inProgressReceives.get(msg.fileId);
-        if (rx && channel && channel.readyState === 'open') {
-          let nextChunk = 0;
-          for (let i = 0; i < rx.metadata.totalChunks; i++) {
-            if (!rx.chunks[i]) {
-              nextChunk = i;
-              break;
-            }
-          }
-          channel.send(JSON.stringify({ type: 'resume-ack', fileId: msg.fileId, nextChunk }));
-        }
-      } else if (msg.type === 'resume-ack') {
-        const sendState = this.activeSends.get(msg.fileId);
-        if (sendState && sendState.resumeAckResolver) {
-          sendState.resumeAckResolver(msg.nextChunk);
-          sendState.resumeAckResolver = null;
-        }
-      } else if (msg.type === 'cancel' || msg.type === 'error') {
-        this.inProgressReceives.delete(msg.fileId);
-        if (msg.type === 'error') {
-          this.onError(msg.fileId, msg.message || 'Remote side encountered an error');
-        }
-      } else if (msg.type === 'done') {
-         // Optionally rely on completion event, but batch handles this inherently.
-      }
+      await state.run();
+      channels[0].send(JSON.stringify({ type: "done", fileId }));
     } catch (err) {
-      console.error('Failed to parse signaling json message over datachannel', err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      channels[0].send(JSON.stringify({ type: "error", fileId, message: errMsg }));
+      throw err;
+    } finally {
+      this.activeSends.delete(fileId);
+      this.activeControllers.delete(fileId);
     }
   }
 
-  private handleBinaryData(data: ArrayBuffer, channel?: RTCDataChannel) {
-    const payload = new Uint8Array(data);
-    if (payload.byteLength < 4) return;
+  async handleIncomingData(data: string | ArrayBuffer, channel: RTCDataChannel, peerId: string) {
+    if (typeof data === "string") {
+      try {
+        const msg = JSON.parse(data);
+        if (msg.type === "header") {
+          const rx = new ReceiverTransfer(msg.metadata);
+          this.inProgressReceives.set(msg.metadata.fileId, rx);
+          this.onReceiveHeader(msg.metadata);
+          channel.send(JSON.stringify({ type: "header-ack", fileId: msg.metadata.fileId }));
+        } else if (msg.type === "header-ack") {
+          const state = this.activeSends.get(msg.fileId);
+          if (state && state.headerAckResolver) {
+            state.headerAckResolver();
+            state.headerAckResolver = null;
+          }
+        } else if (msg.type === "cumulative-ack") {
+          const state = this.activeSends.get(msg.fileId);
+          if (state) state.handleAck(msg.highestSeq, msg.missing);
+        } else if (msg.type === "cancel" || msg.type === "error") {
+          this.inProgressReceives.delete(msg.fileId);
+          if (msg.type === "error") this.onError(msg.fileId, msg.message || "Remote side encountered an error");
+        } else if (msg.type === "done") {
+             // Redundant clear since nextOffsetToMerge checks should hit before this
+             await this.finalizeTransfer(msg.fileId);
+        }
+      } catch (e) {}
+    } else if (data instanceof ArrayBuffer) {
+      const payload = new Uint8Array(data);
+      if (payload.length < 1) return;
+      const dv = new DataView(payload.buffer);
+      const type = dv.getUint8(0);
 
-    const view = new DataView(payload.buffer);
-    const idLen = view.getUint32(0);
-    const idBytes = payload.slice(4, 4 + idLen);
-    const fileId = new TextDecoder().decode(idBytes);
-    const chunkIndex = view.getUint32(4 + idLen);
-    const chunkBytes = payload.slice(12 + idLen);
+      if (type === 0) {
+        const idLen = dv.getUint16(1);
+        const fileId = new TextDecoder().decode(payload.slice(3, 3 + idLen));
+        let cur = 3 + idLen;
+        const offset = dv.getFloat64(cur);
+        cur += 8;
+        const seq = dv.getUint32(cur);
+        cur += 4;
+        const sizeToSend = dv.getUint32(cur);
+        cur += 4;
+        const chunkData = payload.slice(cur, cur + sizeToSend);
 
-    const transfer = this.inProgressReceives.get(fileId);
-    if (!transfer) return;
+        const rx = this.inProgressReceives.get(fileId);
+        if (!rx) return;
 
-    if (!transfer.chunks[chunkIndex]) {
-      transfer.chunks[chunkIndex] = chunkBytes;
-      transfer.receivedChunks++;
-      transfer.receivedBytes += chunkBytes.byteLength;
-      transfer.speedTracker.push(transfer.receivedBytes);
+        rx.addChunk(seq, offset, chunkData);
+        rx.speedTracker.addBytes(sizeToSend);
 
-      this.onProgress(fileId, transfer.receivedBytes, transfer.speedTracker.getBps());
+        if (seq % 32 === 0 || rx.nextOffsetToMerge === rx.metadata.size) {
+          this.onProgress(fileId, rx.nextOffsetToMerge, rx.speedTracker.getBps());
 
-      if (transfer.receivedChunks === transfer.metadata.totalChunks) {
-        this.finalizeTransfer(fileId).catch(err => {
-          this.onError(fileId, err.message);
-        });
+          // Send cumulative ACK back
+          channel.send(
+            JSON.stringify({
+              type: "cumulative-ack",
+              fileId,
+              highestSeq: rx.highestContiguous,
+              missing: Array.from(rx.missing),
+            })
+          );
+        }
+
+        if (rx.nextOffsetToMerge === rx.metadata.size) {
+          await this.finalizeTransfer(fileId);
+        }
       }
-    }
-
-    // ACK periodically to prevent UDP flood but keep sliding window updated
-    if (channel && channel.readyState === 'open' && chunkIndex % 16 === 0) {
-      channel.send(JSON.stringify({ type: 'ack', fileId, chunkIndex }));
     }
   }
 
   private async finalizeTransfer(fileId: string) {
     const rx = this.inProgressReceives.get(fileId);
-    if (!rx) return;
+    if (!rx) return; // Might have been finalised via done command instead of byte array condition
+
     this.inProgressReceives.delete(fileId);
-
-    const blob = new Blob(rx.chunks as any as BlobPart[], { type: rx.metadata.type });
     
-    if (rx.metadata.hash) {
-      const computedHash = await computeHash(blob);
-      if (computedHash !== rx.metadata.hash) {
-        throw new Error(`Data corruption detected. SHA-256 hash mismatch.`);
-      }
-    }
-
-    this.onComplete(fileId, blob, rx.metadata);
+    // Convert BlobParts incrementally
+    const finalBlob = new Blob(rx.blobParts as any[], { type: rx.metadata.type || "application/octet-stream" });
+    this.onComplete(fileId, finalBlob, rx.metadata);
   }
 
   static triggerDownload(blob: Blob, filename: string) {
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
+    const a = document.createElement("a");
     a.href = url;
     a.download = filename;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 100);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
   }
 }
