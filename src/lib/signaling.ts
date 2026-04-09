@@ -4,6 +4,7 @@ type SignalingEvents = {
   onPeerJoined: (peerId: string, name: string) => void;
   onPeerLeft: (peerId: string) => void;
   onMessage: (message: any) => void;
+  onError?: (message: string) => void;
 };
 
 export class SignalingClient {
@@ -49,6 +50,9 @@ export class SignalingClient {
           case 'ice-candidate':
             this.events.onMessage(data);
             break;
+          case 'error':
+            this.events.onError?.(data.message);
+            break;
         }
       };
 
@@ -68,8 +72,8 @@ export class SignalingClient {
     }
   }
 
-  join(roomId: string, name: string) {
-    this.send({ type: 'join', roomId, name });
+  join(roomId: string, name: string, password?: string) {
+    this.send({ type: 'join', roomId, name, password });
   }
 
   send(data: any) {

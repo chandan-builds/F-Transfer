@@ -97,7 +97,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-function handleJoin(clientId, roomId, name) {
+function handleJoin(clientId, roomId, name, password) {
   const client = clients.get(clientId);
   if (!client) return;
 
@@ -110,13 +110,20 @@ function handleJoin(clientId, roomId, name) {
   client.roomId = roomId;
 
   if (!rooms.has(roomId)) {
-    rooms.set(roomId, new Set());
+    rooms.set(roomId, { clients: new Set(), password: password || null });
   }
 
-  const roomClients = rooms.get(roomId);
+  const room = rooms.get(roomId);
+
+  // Check password if set
+  if (room.password && room.password !== password) {
+    client.ws.send(JSON.stringify({ type: 'error', message: 'invalid-password' }));
+    client.roomId = null; // Revert roomId
+    return;
+  }
 
   // Notify others in the room
-  for (const otherClientId of roomClients) {
+  for (const otherClientId of room.clients) {
     const otherClient = clients.get(otherClientId);
     if (otherClient && otherClient.ws.readyState === 1) { // WebSocket.OPEN
       otherClient.ws.send(JSON.stringify({
@@ -127,10 +134,10 @@ function handleJoin(clientId, roomId, name) {
     }
   }
 
-  roomClients.add(clientId);
+  room.clients.add(clientId);
 
   // Send current peers to the joining client
-  const peers = Array.from(roomClients)
+  const peers = Array.from(room.clients)
     .filter(id => id !== clientId)
     .map(id => ({ id, name: clients.get(id).name }));
 
@@ -156,13 +163,13 @@ function handleLeave(clientId) {
   if (!client || !client.roomId) return;
 
   const roomId = client.roomId;
-  const roomClients = rooms.get(roomId);
+  const room = rooms.get(roomId);
 
-  if (roomClients) {
-    roomClients.delete(clientId);
+  if (room) {
+    room.clients.delete(clientId);
 
     // Notify others
-    for (const otherClientId of roomClients) {
+    for (const otherClientId of room.clients) {
       const otherClient = clients.get(otherClientId);
       if (otherClient && otherClient.ws.readyState === 1) {
         otherClient.ws.send(JSON.stringify({
@@ -173,7 +180,7 @@ function handleLeave(clientId) {
     }
 
     // Cleanup empty rooms
-    if (roomClients.size === 0) {
+    if (room.clients.size === 0) {
       rooms.delete(roomId);
     }
   }

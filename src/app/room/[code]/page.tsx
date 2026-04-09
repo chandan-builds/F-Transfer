@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback, use } from "react";
+import { useSearchParams } from "next/navigation";
 import { Header } from "@/components/Header";
 import { GitStamp } from "@/components/GitStamp";
 import { SignalingClient } from "@/lib/signaling";
@@ -23,6 +24,7 @@ import {
   Gauge,
   ArrowDownToLine,
   ArrowUpFromLine,
+  Shield,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -71,6 +73,7 @@ function formatEta(remaining: number, bps: number): string {
 // ─── Page ────────────────────────────────────────────────────────
 export default function RoomPage({ params }: { params: Promise<{ code: string }> }) {
   const { code } = use(params);
+  const searchParams = useSearchParams();
   const roomId = code.toUpperCase();
 
   const [clientId, setClientId] = useState("");
@@ -154,10 +157,11 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
     rtcManagerRef.current = rtc;
 
     // 3. Signaling Client
+    const password = searchParams.get("pw") || undefined;
     const sig = new SignalingClient(getSignalingUrl(), {
       onConnected: (id) => {
         setClientId(id);
-        sig.join(roomId, `Peer-${id.substring(0, 4)}`);
+        sig.join(roomId, `Peer-${id.substring(0, 4)}`, password);
       },
       onRoomJoined: (roomPeers) => {
         setPeers(roomPeers.map((p) => ({ ...p, connected: false })));
@@ -171,6 +175,12 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
         rtc.cleanupPeer(peerId);
       },
       onMessage: (msg) => rtc.handleSignalingMessage(msg),
+      onError: (msg) => {
+        if (msg === "invalid-password") {
+          alert("Invalid password for this room! Please check the link or enter the correct password.");
+          window.location.href = "/";
+        }
+      },
     });
     sigClientRef.current = sig;
     sig.connect();
@@ -233,7 +243,7 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
             if (bytes >= file.size) {
               updateTransfer(fId, { status: "complete", speed: 0 });
             }
-          }, controller)
+          }, controller, fileId)
           .catch((err) => {
             const msg = (err as Error).message;
             if (msg === "Transfer cancelled") {
@@ -264,6 +274,21 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
   return (
     <main className="min-h-screen flex flex-col">
       <Header roomCode={roomId} />
+
+      <div className="max-w-7xl mx-auto w-full px-4 pt-4">
+        <div className="flex items-center gap-4 mb-2">
+          <div className="flex items-center gap-2 bg-surface px-4 py-2 rounded-xl border border-border shadow-sm">
+            <span className="text-xs font-bold uppercase tracking-wider text-muted">Room</span>
+            <span className="font-mono font-bold text-primary">{roomId}</span>
+          </div>
+          {searchParams.get("pw") && (
+            <div className="flex items-center gap-2 bg-accent/20 px-3 py-1.5 rounded-lg border border-accent/30 text-accent">
+              <Shield size={14} />
+              <span className="text-xs font-bold uppercase">Locked</span>
+            </div>
+          )}
+        </div>
+      </div>
 
       <div className="flex-1 max-w-7xl mx-auto w-full p-4 grid grid-cols-1 md:grid-cols-3 gap-6">
         {/* ──────────── Left: Dropzone + Transfers ──────────── */}
@@ -386,10 +411,14 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
                               tf.status === "receiving" && "bg-accent/20 text-accent"
                             )}
                           >
-                            {tf.status === "complete" && (
-                              <CheckCircle2 size={14} className="inline -mt-0.5 mr-1" />
+                            {tf.status === "complete" ? (
+                              <span className="flex items-center">
+                                <CheckCircle2 size={14} className="mr-1" />
+                                {tf.controller ? "Sent" : "Received"}
+                              </span>
+                            ) : (
+                              tf.status
                             )}
-                            {tf.status}
                           </span>
 
                           {/* Controls: Pause / Resume / Cancel */}

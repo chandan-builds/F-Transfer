@@ -10,17 +10,20 @@ import { motion } from "framer-motion";
 export default function Home() {
   const router = useRouter();
   const [joinCode, setJoinCode] = useState("");
+  const [password, setPassword] = useState("");
 
   const handleCreateRoom = () => {
     // Generate a random 6-character hex code
     const code = Math.random().toString(16).substring(2, 8).toUpperCase();
-    router.push(`/room/${code}`);
+    const query = password ? `?pw=${encodeURIComponent(password)}` : "";
+    router.push(`/room/${code}${query}`);
   };
 
   const handleJoinRoom = (e: React.FormEvent) => {
     e.preventDefault();
     if (joinCode.trim().length >= 6) {
-      router.push(`/room/${joinCode.trim().toUpperCase()}`);
+      const query = password ? `?pw=${encodeURIComponent(password)}` : "";
+      router.push(`/room/${joinCode.trim().toUpperCase()}${query}`);
     }
   };
 
@@ -85,6 +88,13 @@ export default function Home() {
               onChange={(e) => setJoinCode(e.target.value)}
               maxLength={6}
               className="w-full text-center uppercase tracking-widest font-mono text-xl py-4 bg-background border border-border rounded-xl focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all"
+            />
+            <input
+              type="password"
+              placeholder="Optional Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="w-full text-center py-4 bg-background border border-border rounded-xl focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all"
             />
             <button
               type="submit"

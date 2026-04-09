@@ -174,14 +174,31 @@ class SendScheduler {
       channel = this.channels.find((c) => c.readyState === "open") || channel;
     }
 
-    // Per-channel backpressure control
-    if (channel.bufferedAmount > 2 * 1024 * 1024) {
-      await new Promise<void>((resolve) => {
+    // Per-channel backpressure control - 256KB to avoid bufferbloat dropping ICE heartbeats
+    if (channel.bufferedAmount > 256 * 1024) {
+      await new Promise<void>((resolve, reject) => {
         const handler = () => {
-          channel.removeEventListener("bufferedamountlow", handler);
+          cleanup();
           resolve();
         };
+        const closeHandler = () => {
+          cleanup();
+          reject(new Error("Channel closed while buffering"));
+        };
+        const errorHandler = () => {
+          cleanup();
+          reject(new Error("Channel error while buffering"));
+        };
+
+        const cleanup = () => {
+          channel.removeEventListener("bufferedamountlow", handler);
+          channel.removeEventListener("close", closeHandler);
+          channel.removeEventListener("error", errorHandler);
+        };
+
         channel.addEventListener("bufferedamountlow", handler);
+        channel.addEventListener("close", closeHandler);
+        channel.addEventListener("error", errorHandler);
       });
     }
     return channel;
@@ -308,6 +325,7 @@ export class FileTransferManager {
   private webrtcManager?: any; // Avoiding cyclic ref with WebRTCManager directly
 
   private inProgressReceives = new Map<string, ReceiverTransfer>();
+  private completedReceives = new Set<string>();
   private activeSends = new Map<string, SendScheduler>();
   activeControllers = new Map<string, TransferController>();
 
@@ -330,7 +348,7 @@ export class FileTransferManager {
     }
     if (!channels.find((c) => c.label === channel.label)) {
       channels.push(channel);
-      channel.bufferedAmountLowThreshold = 1024 * 1024; // 1MB threshold per channel
+      channel.bufferedAmountLowThreshold = 64 * 1024; // 64KB threshold per channel
 
       channel.addEventListener("message", (e) => {
         this.handleIncomingData(e.data, channel, peerId);
@@ -343,12 +361,13 @@ export class FileTransferManager {
     file: File,
     peerId: string,
     onSendProgress: SpeedProgressCallback,
-    controller?: TransferController
+    controller?: TransferController,
+    providedFileId?: string
   ): Promise<void> {
     const channels = this.peerChannels.get(peerId) || [];
     if (channels.length === 0) throw new Error("No DataChannels available for " + peerId);
 
-    const fileId = `${file.name}-${Date.now()}`;
+    const fileId = providedFileId || `${file.name}-${Date.now()}`;
     const ctrl = controller ?? new TransferController();
     this.activeControllers.set(fileId, ctrl);
 
@@ -370,10 +389,13 @@ export class FileTransferManager {
     const state = new SendScheduler(file, fileId, channels, pc, ctrl, onSendProgress);
     this.activeSends.set(fileId, state);
 
-    // Wait for header ack (using explicit Promise mechanism)
+    // Wait for header ack
     await new Promise<void>((resolve, reject) => {
-      state.headerAckResolver = resolve;
-      setTimeout(() => reject(new Error("Header ACK timeout")), 10000);
+      const timeout = setTimeout(() => reject(new Error("Header ACK timeout")), 10000);
+      state.headerAckResolver = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
     });
 
     try {
@@ -434,7 +456,19 @@ export class FileTransferManager {
         const chunkData = payload.slice(cur, cur + sizeToSend);
 
         const rx = this.inProgressReceives.get(fileId);
-        if (!rx) return;
+        if (!rx) {
+          if (this.completedReceives.has(fileId)) {
+            channel.send(
+              JSON.stringify({
+                type: "cumulative-ack",
+                fileId,
+                highestSeq: seq,
+                missing: [],
+              })
+            );
+          }
+          return;
+        }
 
         rx.addChunk(seq, offset, chunkData);
         rx.speedTracker.addBytes(sizeToSend);
@@ -465,6 +499,7 @@ export class FileTransferManager {
     if (!rx) return; // Might have been finalised via done command instead of byte array condition
 
     this.inProgressReceives.delete(fileId);
+    this.completedReceives.add(fileId);
     
     // Convert BlobParts incrementally
     const finalBlob = new Blob(rx.blobParts as any[], { type: rx.metadata.type || "application/octet-stream" });
