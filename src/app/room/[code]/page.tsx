@@ -11,6 +11,11 @@ import { Upload, X, CheckCircle2, FileJson, Users, Activity } from "lucide-react
 import { cn } from "@/lib/utils";
 
 const getSignalingUrl = () => {
+  // If we deployed to Vercel, we can set NEXT_PUBLIC_SIGNALING_URL=wss://our-render-backend.onrender.com
+  if (process.env.NEXT_PUBLIC_SIGNALING_URL) {
+    return process.env.NEXT_PUBLIC_SIGNALING_URL;
+  }
+  // Otherwise, default to auto-detecting LAN connections
   if (typeof window === "undefined") return "ws://127.0.0.1:3001";
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.hostname}:3001`;
