@@ -6,7 +6,7 @@ export type PeerEvents = {
 
 // Configuration for LAN/Wifi explicitly - no STUN/TURN servers to guarantee local transfer
 export const rtcConfig: RTCConfiguration = {
-  iceServers: [] 
+  iceServers: []
 };
 
 export class WebRTCManager {
@@ -20,18 +20,24 @@ export class WebRTCManager {
     this.events = events;
   }
 
+  /** Public accessor — lets the room page grab a channel without casting to any */
+  getDataChannel(peerId: string): RTCDataChannel | undefined {
+    return this.dataChannels.get(peerId);
+  }
+
   // Called when we want to originate a connection to another peer
   async connectToPeer(peerId: string): Promise<void> {
     if (this.peers.has(peerId)) return;
 
     const pc = this.createPeerConnection(peerId);
-    
-    // Create reliable data channel for file transfer
+
+    // Create reliable, ordered data channel for file transfer
     const dataChannel = pc.createDataChannel('f-transfer-data', {
       ordered: true,
-      maxRetransmits: undefined, // undefined = reliable
+      // undefined = reliable (no maxRetransmits limit)
+      maxRetransmits: undefined,
     });
-    
+
     this.setupDataChannel(peerId, dataChannel);
 
     // Create and send offer
