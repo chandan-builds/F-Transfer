@@ -2,7 +2,7 @@ const { WebSocketServer } = require('ws');
 const { v4: uuidv4 } = require('uuid');
 
 const PORT = process.env.PORT || 3001;
-const wss = new WebSocketServer({ port: PORT });
+const wss = new WebSocketServer({ port: PORT, host: '0.0.0.0' });
 
 // State: Store rooms and connected clients
 // rooms = { [roomId]: Set<clientIds> }

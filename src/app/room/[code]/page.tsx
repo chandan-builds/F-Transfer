@@ -10,9 +10,11 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Upload, X, CheckCircle2, FileJson, Users, Activity } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-// In production, this would be your Render websocket URL from env vars
-// export const SIGNALING_URL = process.env.NEXT_PUBLIC_SIGNALING_URL || "ws://localhost:3001";
-export const SIGNALING_URL = "ws://localhost:3001";
+const getSignalingUrl = () => {
+  if (typeof window === "undefined") return "ws://127.0.0.1:3001";
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.hostname}:3001`;
+};
 
 interface FileProgress {
   id: string;
@@ -101,7 +103,7 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
     rtcManagerRef.current = rtc;
 
     // 3. Setup Signaling Client
-    const sig = new SignalingClient(SIGNALING_URL, {
+    const sig = new SignalingClient(getSignalingUrl(), {
       onConnected: (id) => {
         setClientId(id);
         sig.join(roomId, `Peer-${id.substring(0, 4)}`);
