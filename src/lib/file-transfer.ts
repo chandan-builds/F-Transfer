@@ -4,30 +4,25 @@ export type TransferMetadata = {
   size: number;
   type: string;
   totalChunks: number;
+  hash: string;
 };
 
 export type ProgressCallback = (fileId: string, bytesTransferred: number) => void;
 export type CompleteCallback = (fileId: string, file: Blob, metadata: TransferMetadata) => void;
+export type ErrorCallback = (fileId: string, error: string) => void;
+export type SpeedProgressCallback = (fileId: string, bytesTransferred: number, speedBps: number) => void;
 
-// ─── Performance tuning ──────────────────────────────────────────
-// 256KB chunks → ~4× less overhead than 64KB, well within SCTP limits
-const CHUNK_SIZE = 256 * 1024;
-// Use event-driven backpressure: buffer low watermark
-const BUFFER_LOW_THRESHOLD = 512 * 1024;   // resume sending when buffer drops below 512KB
-const BUFFER_HIGH_THRESHOLD = 2 * 1024 * 1024; // pause sending when buffer exceeds 2MB
+// Strict 64KB chunk size to avoid DataChannel buffer overflow
+const CHUNK_SIZE = 64 * 1024;
+const BUFFER_LOW_THRESHOLD = 128 * 1024;  
+const BUFFER_HIGH_THRESHOLD = 512 * 1024;
 
-// ─── Transfer Controller ─────────────────────────────────────────
-// Tracks live state for a single outbound transfer so we can
-// pause / resume / cancel from the UI.
 export class TransferController {
   paused = false;
   cancelled = false;
   private _resumeResolver: (() => void) | null = null;
 
-  pause() {
-    this.paused = true;
-  }
-
+  pause() { this.paused = true; }
   resume() {
     this.paused = false;
     if (this._resumeResolver) {
@@ -35,57 +30,49 @@ export class TransferController {
       this._resumeResolver = null;
     }
   }
-
   cancel() {
     this.cancelled = true;
-    // Also unblock the loop so it can exit
     this.resume();
   }
-
-  /** Returns a promise that resolves when resume() is called */
   waitForResume(): Promise<void> {
-    return new Promise<void>((resolve) => {
+    return new Promise((resolve) => {
       this._resumeResolver = resolve;
     });
   }
 }
 
-// ─── Speed Tracker ───────────────────────────────────────────────
-// A tiny ring-buffer that stores recent byte snapshots so we can
-// compute a smoothed MB/s figure instead of a jittery instant one.
 class SpeedTracker {
   private samples: { time: number; bytes: number }[] = [];
-  private windowMs = 2000; // 2-second sliding window
+  private windowMs = 2000;
 
   push(bytes: number) {
     const now = performance.now();
     this.samples.push({ time: now, bytes });
-    // Prune old samples
     while (this.samples.length > 0 && now - this.samples[0].time > this.windowMs) {
       this.samples.shift();
     }
   }
 
-  /** Returns bytes per second averaged over the window */
   getBps(): number {
     if (this.samples.length < 2) return 0;
     const oldest = this.samples[0];
     const newest = this.samples[this.samples.length - 1];
-    const dt = (newest.time - oldest.time) / 1000; // seconds
+    const dt = (newest.time - oldest.time) / 1000;
     if (dt === 0) return 0;
-    const db = newest.bytes - oldest.bytes;
-    return db / dt;
+    return (newest.bytes - oldest.bytes) / dt;
   }
 }
 
-// ─── Enhanced progress callback with speed ───────────────────────
-export type SpeedProgressCallback = (
-  fileId: string,
-  bytesTransferred: number,
-  speedBps: number
-) => void;
+async function computeHash(blob: Blob): Promise<string> {
+  // Avoid fully buffer.arrayBuffer() loading of very large files on constrained devices.
+  // We'll digest up to early 50MB to get an integrity fingerprint.
+  const slice = blob.size > 50_000_000 ? blob.slice(0, 50_000_000) : blob; 
+  const buffer = await slice.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
 
-// ─── FileTransferManager ─────────────────────────────────────────
 export class FileTransferManager {
   private inProgressReceives: Map<string, {
     metadata: TransferMetadata;
@@ -95,18 +82,25 @@ export class FileTransferManager {
     speedTracker: SpeedTracker;
   }> = new Map();
 
-  // Registry of active outbound controllers so the UI can pause/cancel
+  private activeSends: Map<string, {
+    channel: RTCDataChannel;
+    lastAcked: number;
+    headerAckResolver: (() => void) | null;
+    resumeAckResolver: ((nextChunk: number) => void) | null;
+  }> = new Map();
+
   activeControllers: Map<string, TransferController> = new Map();
 
   private onProgress: SpeedProgressCallback;
   private onComplete: CompleteCallback;
+  private onError: ErrorCallback;
 
-  constructor(onProgress: SpeedProgressCallback, onComplete: CompleteCallback) {
+  constructor(onProgress: SpeedProgressCallback, onComplete: CompleteCallback, onError: ErrorCallback) {
     this.onProgress = onProgress;
     this.onComplete = onComplete;
+    this.onError = onError;
   }
 
-  // ── Outbound: send a file ──────────────────────────────────────
   async sendFile(
     file: File,
     channel: RTCDataChannel,
@@ -117,30 +111,42 @@ export class FileTransferManager {
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     const ctrl = controller ?? new TransferController();
 
-    // Register so the UI can call ctrl.pause() / ctrl.cancel()
     this.activeControllers.set(fileId, ctrl);
 
+    const hash = await computeHash(file);
     const metadata: TransferMetadata = {
-      fileId,
-      name: file.name,
-      size: file.size,
-      type: file.type,
-      totalChunks
+      fileId, name: file.name, size: file.size, type: file.type, totalChunks, hash
     };
 
-    // 1. Send metadata header as text
+    const sendState = {
+      channel,
+      lastAcked: -1,
+      headerAckResolver: null as (() => void) | null,
+      resumeAckResolver: null as ((nc: number) => void) | null
+    };
+    this.activeSends.set(fileId, sendState);
+
+    // Send header via JSON
     channel.send(JSON.stringify({ type: 'header', metadata }));
 
-    // 2. Setup event-driven backpressure
-    channel.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD;
+    // Wait for header ACK to ensure the receiver is fully ready
+    await new Promise<void>((resolve) => {
+      sendState.headerAckResolver = resolve;
+      // Auto-fallback in case of slow or dropped signaling for header-ack
+      setTimeout(() => { if (sendState.headerAckResolver) resolve(); }, 5000);
+    });
+    sendState.headerAckResolver = null;
 
+    channel.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD;
     const speedTracker = new SpeedTracker();
-    let offset = 0;
     let chunkIndex = 0;
 
-    // Helper: wait until bufferedAmount drops
     const waitForDrain = (): Promise<void> =>
       new Promise((resolve) => {
+        if (channel.bufferedAmount <= BUFFER_LOW_THRESHOLD) {
+          resolve();
+          return;
+        }
         const handler = () => {
           channel.removeEventListener('bufferedamountlow', handler);
           resolve();
@@ -148,121 +154,202 @@ export class FileTransferManager {
         channel.addEventListener('bufferedamountlow', handler);
       });
 
-    // 3. Stream chunks
-    while (offset < file.size) {
-      // ── Cancel check ──
-      if (ctrl.cancelled) {
-        channel.send(JSON.stringify({ type: 'cancel', fileId }));
-        this.activeControllers.delete(fileId);
-        throw new Error('Transfer cancelled');
-      }
-
-      // ── Pause check ──
-      if (ctrl.paused) {
-        await ctrl.waitForResume();
+    try {
+      while (chunkIndex < totalChunks) {
         if (ctrl.cancelled) {
           channel.send(JSON.stringify({ type: 'cancel', fileId }));
-          this.activeControllers.delete(fileId);
           throw new Error('Transfer cancelled');
         }
+
+        if (ctrl.paused) {
+          channel.send(JSON.stringify({ type: 'pause', fileId }));
+          await ctrl.waitForResume();
+          if (ctrl.cancelled) {
+            channel.send(JSON.stringify({ type: 'cancel', fileId }));
+            throw new Error('Transfer cancelled');
+          }
+          
+          // Request resume chunk index explicitly
+          channel.send(JSON.stringify({ type: 'request-resume', fileId }));
+          chunkIndex = await new Promise<number>((resolve) => {
+            sendState.resumeAckResolver = resolve;
+            setTimeout(() => {
+              if (sendState.resumeAckResolver) {
+                resolve(sendState.lastAcked + 1);
+              }
+            }, 5000);
+          });
+          sendState.resumeAckResolver = null;
+          if (chunkIndex >= totalChunks) break;
+        }
+
+        if (channel.readyState !== 'open') {
+          throw new Error('DataChannel closed unexpectedly');
+        }
+
+        if (channel.bufferedAmount > BUFFER_HIGH_THRESHOLD) {
+          await waitForDrain();
+        }
+
+        const offset = chunkIndex * CHUNK_SIZE;
+        const end = Math.min(offset + CHUNK_SIZE, file.size);
+        const slice = file.slice(offset, end);
+        const buffer = await slice.arrayBuffer();
+
+        // Safe Binary protocol layout: fileIdLen (4) | fileId (bytes) | chunkIndex (4) | totalChunks (4) | data
+        const idBytes = new TextEncoder().encode(fileId);
+        const payload = new Uint8Array(4 + idBytes.length + 8 + buffer.byteLength);
+        const view = new DataView(payload.buffer);
+        view.setUint32(0, idBytes.length);
+        payload.set(idBytes, 4);
+        view.setUint32(4 + idBytes.length, chunkIndex);
+        view.setUint32(8 + idBytes.length, totalChunks);
+        payload.set(new Uint8Array(buffer), 12 + idBytes.length);
+
+        channel.send(payload);
+
+        speedTracker.push(end);
+        onSendProgress(fileId, end, speedTracker.getBps());
+
+        chunkIndex++;
       }
-
-      // ── Backpressure: wait if the send buffer is full ──
-      if (channel.bufferedAmount > BUFFER_HIGH_THRESHOLD) {
-        await waitForDrain();
+      
+      // Notify completion explicitly
+      channel.send(JSON.stringify({ type: 'done', fileId }));
+    } catch (err: any) {
+      if (err.message !== 'Transfer cancelled') {
+        try {
+          channel.send(JSON.stringify({ type: 'error', fileId, message: err.message }));
+        } catch(e) {}
       }
-
-      // ── Read chunk using the fast slice→arrayBuffer path ──
-      const end = Math.min(offset + CHUNK_SIZE, file.size);
-      const slice = file.slice(offset, end);
-      const buffer = await slice.arrayBuffer();
-
-      // ── Build a compact binary frame ──
-      // Layout: [4 bytes header-len][JSON header bytes][file data bytes]
-      const headerStr = `{"t":"c","f":"${fileId}","i":${chunkIndex}}`;
-      const headerBytes = new TextEncoder().encode(headerStr);
-      const headerLen = headerBytes.length;
-
-      const payload = new Uint8Array(4 + headerLen + buffer.byteLength);
-      new DataView(payload.buffer).setUint32(0, headerLen);
-      payload.set(headerBytes, 4);
-      payload.set(new Uint8Array(buffer), 4 + headerLen);
-
-      channel.send(payload);
-
-      offset = end;
-      chunkIndex++;
-
-      speedTracker.push(offset);
-      onSendProgress(fileId, offset, speedTracker.getBps());
+      this.cleanupSend(fileId);
+      throw err;
     }
 
+    this.cleanupSend(fileId);
+  }
+
+  private cleanupSend(fileId: string) {
+    this.activeSends.delete(fileId);
     this.activeControllers.delete(fileId);
   }
 
-  // ── Inbound: handle received data ──────────────────────────────
-  handleIncomingData(data: string | ArrayBuffer) {
+  handleIncomingData(data: string | ArrayBuffer, channel?: RTCDataChannel) {
     if (typeof data === 'string') {
-      try {
-        const msg = JSON.parse(data);
-        if (msg.type === 'header') {
-          const { metadata } = msg;
-          this.inProgressReceives.set(metadata.fileId, {
-            metadata,
-            chunks: new Array(metadata.totalChunks),
-            receivedChunks: 0,
-            receivedBytes: 0,
-            speedTracker: new SpeedTracker()
-          });
-        } else if (msg.type === 'cancel') {
-          // Sender cancelled – discard partial data
-          this.inProgressReceives.delete(msg.fileId);
-        }
-      } catch (err) {
-        console.error('Failed to parse text message', err);
-      }
+      this.handleJsonData(data, channel);
     } else if (data instanceof ArrayBuffer) {
-      const payload = new Uint8Array(data);
-      if (payload.byteLength < 4) return;
-
-      const headerLength = new DataView(payload.buffer).getUint32(0);
-      const headerBytes = payload.slice(4, 4 + headerLength);
-      const chunkBytes = payload.slice(4 + headerLength);
-
-      const headerStr = new TextDecoder().decode(headerBytes);
-      try {
-        const header = JSON.parse(headerStr);
-        // Compact key names: t=type, f=fileId, i=chunkIndex
-        if (header.t === 'c') {
-          const fileId = header.f;
-          const chunkIndex = header.i;
-          const transfer = this.inProgressReceives.get(fileId);
-
-          if (transfer) {
-            transfer.chunks[chunkIndex] = chunkBytes;
-            transfer.receivedChunks++;
-            transfer.receivedBytes += chunkBytes.byteLength;
-            transfer.speedTracker.push(transfer.receivedBytes);
-
-            this.onProgress(fileId, transfer.receivedBytes, transfer.speedTracker.getBps());
-
-            if (transfer.receivedChunks === transfer.metadata.totalChunks) {
-              // Assembly complete!
-              const blob = new Blob(transfer.chunks as any as BlobPart[], {
-                type: transfer.metadata.type
-              });
-              this.onComplete(fileId, blob, transfer.metadata);
-              this.inProgressReceives.delete(fileId);
-            }
-          }
-        }
-      } catch (err) {
-        console.error('Failed to parse chunk header', err);
-      }
+      this.handleBinaryData(data, channel);
     }
   }
 
-  // ── Utility to download the completed blob ─────────────────────
+  private handleJsonData(data: string, channel?: RTCDataChannel) {
+    try {
+      const msg = JSON.parse(data);
+      if (msg.type === 'header') {
+        this.inProgressReceives.set(msg.metadata.fileId, {
+          metadata: msg.metadata,
+          chunks: new Array(msg.metadata.totalChunks),
+          receivedChunks: 0,
+          receivedBytes: 0,
+          speedTracker: new SpeedTracker()
+        });
+        if (channel && channel.readyState === 'open') {
+          channel.send(JSON.stringify({ type: 'header-ack', fileId: msg.metadata.fileId }));
+        }
+      } else if (msg.type === 'header-ack') {
+        const sendState = this.activeSends.get(msg.fileId);
+        if (sendState && sendState.headerAckResolver) {
+          sendState.headerAckResolver();
+          sendState.headerAckResolver = null;
+        }
+      } else if (msg.type === 'ack') {
+        const sendState = this.activeSends.get(msg.fileId);
+        if (sendState) {
+          sendState.lastAcked = Math.max(sendState.lastAcked, msg.chunkIndex);
+        }
+      } else if (msg.type === 'request-resume') {
+        const rx = this.inProgressReceives.get(msg.fileId);
+        if (rx && channel && channel.readyState === 'open') {
+          let nextChunk = 0;
+          for (let i = 0; i < rx.metadata.totalChunks; i++) {
+            if (!rx.chunks[i]) {
+              nextChunk = i;
+              break;
+            }
+          }
+          channel.send(JSON.stringify({ type: 'resume-ack', fileId: msg.fileId, nextChunk }));
+        }
+      } else if (msg.type === 'resume-ack') {
+        const sendState = this.activeSends.get(msg.fileId);
+        if (sendState && sendState.resumeAckResolver) {
+          sendState.resumeAckResolver(msg.nextChunk);
+          sendState.resumeAckResolver = null;
+        }
+      } else if (msg.type === 'cancel' || msg.type === 'error') {
+        this.inProgressReceives.delete(msg.fileId);
+        if (msg.type === 'error') {
+          this.onError(msg.fileId, msg.message || 'Remote side encountered an error');
+        }
+      } else if (msg.type === 'done') {
+         // Optionally rely on completion event, but batch handles this inherently.
+      }
+    } catch (err) {
+      console.error('Failed to parse signaling json message over datachannel', err);
+    }
+  }
+
+  private handleBinaryData(data: ArrayBuffer, channel?: RTCDataChannel) {
+    const payload = new Uint8Array(data);
+    if (payload.byteLength < 4) return;
+
+    const view = new DataView(payload.buffer);
+    const idLen = view.getUint32(0);
+    const idBytes = payload.slice(4, 4 + idLen);
+    const fileId = new TextDecoder().decode(idBytes);
+    const chunkIndex = view.getUint32(4 + idLen);
+    const chunkBytes = payload.slice(12 + idLen);
+
+    const transfer = this.inProgressReceives.get(fileId);
+    if (!transfer) return;
+
+    if (!transfer.chunks[chunkIndex]) {
+      transfer.chunks[chunkIndex] = chunkBytes;
+      transfer.receivedChunks++;
+      transfer.receivedBytes += chunkBytes.byteLength;
+      transfer.speedTracker.push(transfer.receivedBytes);
+
+      this.onProgress(fileId, transfer.receivedBytes, transfer.speedTracker.getBps());
+
+      if (transfer.receivedChunks === transfer.metadata.totalChunks) {
+        this.finalizeTransfer(fileId).catch(err => {
+          this.onError(fileId, err.message);
+        });
+      }
+    }
+
+    // ACK periodically to prevent UDP flood but keep sliding window updated
+    if (channel && channel.readyState === 'open' && chunkIndex % 16 === 0) {
+      channel.send(JSON.stringify({ type: 'ack', fileId, chunkIndex }));
+    }
+  }
+
+  private async finalizeTransfer(fileId: string) {
+    const rx = this.inProgressReceives.get(fileId);
+    if (!rx) return;
+    this.inProgressReceives.delete(fileId);
+
+    const blob = new Blob(rx.chunks as any as BlobPart[], { type: rx.metadata.type });
+    
+    if (rx.metadata.hash) {
+      const computedHash = await computeHash(blob);
+      if (computedHash !== rx.metadata.hash) {
+        throw new Error(`Data corruption detected. SHA-256 hash mismatch.`);
+      }
+    }
+
+    this.onComplete(fileId, blob, rx.metadata);
+  }
+
   static triggerDownload(blob: Blob, filename: string) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');

@@ -110,6 +110,11 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
           speed: 0,
         });
         FileTransferManager.triggerDownload(blob, metadata.name);
+      },
+      // onError
+      (fileId, errStr) => {
+        updateTransfer(fileId, { status: "error", speed: 0 });
+        console.error("Transfer error:", errStr);
       }
     );
     fileTransferRef.current = ftm;
@@ -120,7 +125,7 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
       {
         onDataChannel: (_peerId, channel) => {
           channel.onmessage = (event) => {
-            ftm.handleIncomingData(event.data);
+            ftm.handleIncomingData(event.data, channel);
 
             // Register incoming file in UI
             if (typeof event.data === "string") {

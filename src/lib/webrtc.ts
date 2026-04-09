@@ -4,9 +4,17 @@ export type PeerEvents = {
   onConnectionStateChange: (peerId: string, state: RTCPeerConnectionState) => void;
 };
 
-// Configuration for LAN/Wifi explicitly - no STUN/TURN servers to guarantee local transfer
+// Configuration with STUN and placeholder TURN for robust ICE gathering across network boundaries
 export const rtcConfig: RTCConfiguration = {
-  iceServers: []
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { 
+      urls: 'turn:placeholder.turn.server:3478', 
+      username: 'turnuser', 
+      credential: 'turnpassword' 
+    }
+  ]
 };
 
 export class WebRTCManager {
@@ -15,32 +23,33 @@ export class WebRTCManager {
   private events: PeerEvents;
   private signalFunc: (data: any) => void;
 
+  // Queue for ICE candidates received before remote description is set to prevent race conditions
+  private candidateQueue: Map<string, RTCIceCandidateInit[]> = new Map();
+  private isRemoteSet: Map<string, boolean> = new Map();
+
   constructor(signalFunc: (data: any) => void, events: PeerEvents) {
     this.signalFunc = signalFunc;
     this.events = events;
   }
 
-  /** Public accessor — lets the room page grab a channel without casting to any */
   getDataChannel(peerId: string): RTCDataChannel | undefined {
     return this.dataChannels.get(peerId);
   }
 
-  // Called when we want to originate a connection to another peer
   async connectToPeer(peerId: string): Promise<void> {
     if (this.peers.has(peerId)) return;
 
     const pc = this.createPeerConnection(peerId);
 
-    // Create reliable, ordered data channel for file transfer
+    // Create reliable, ordered data channel for file transfer with maxRetransmits
+    // Enforcing SCTP limits for robust P2P transmission
     const dataChannel = pc.createDataChannel('f-transfer-data', {
       ordered: true,
-      // undefined = reliable (no maxRetransmits limit)
-      maxRetransmits: undefined,
+      maxRetransmits: 30,
     });
 
     this.setupDataChannel(peerId, dataChannel);
 
-    // Create and send offer
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -50,11 +59,10 @@ export class WebRTCManager {
         sdp: pc.localDescription
       });
     } catch (err) {
-      console.error('Error creating offer:', err);
+      console.error(`[WebRTC - ${peerId}] Error creating offer:`, err);
     }
   }
 
-  // Handle incoming signaling messages
   async handleSignalingMessage(message: any) {
     const { sourceId, type, sdp, candidate } = message;
 
@@ -66,6 +74,9 @@ export class WebRTCManager {
       }
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        this.isRemoteSet.set(sourceId, true);
+        await this.flushCandidateQueue(sourceId, pc);
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         this.signalFunc({
@@ -74,30 +85,53 @@ export class WebRTCManager {
           sdp: pc.localDescription
         });
       } catch (err) {
-        console.error('Error handling offer:', err);
+        console.error(`[WebRTC - ${sourceId}] Error handling offer:`, err);
       }
     } else if (type === 'answer') {
       if (pc) {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+          this.isRemoteSet.set(sourceId, true);
+          await this.flushCandidateQueue(sourceId, pc);
         } catch (err) {
-          console.error('Error handling answer:', err);
+          console.error(`[WebRTC - ${sourceId}] Error handling answer:`, err);
         }
       }
     } else if (type === 'ice-candidate') {
-      if (pc) {
+      if (pc && this.isRemoteSet.get(sourceId)) {
         try {
           await pc.addIceCandidate(new RTCIceCandidate(candidate));
         } catch (err) {
-          console.error('Error adding ICE candidate:', err);
+          console.error(`[WebRTC - ${sourceId}] Error adding ICE candidate:`, err);
+        }
+      } else {
+        // Queue candidate to avoid StateMachine errors
+        if (!this.candidateQueue.has(sourceId)) {
+          this.candidateQueue.set(sourceId, []);
+        }
+        this.candidateQueue.get(sourceId)!.push(candidate);
+      }
+    }
+  }
+
+  private async flushCandidateQueue(peerId: string, pc: RTCPeerConnection) {
+    const queue = this.candidateQueue.get(peerId);
+    if (queue && queue.length > 0) {
+      for (const candidate of queue) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error(`[WebRTC - ${peerId}] Error adding queued ICE candidate:`, err);
         }
       }
+      this.candidateQueue.set(peerId, []);
     }
   }
 
   private createPeerConnection(peerId: string): RTCPeerConnection {
     const pc = new RTCPeerConnection(rtcConfig);
     this.peers.set(peerId, pc);
+    this.isRemoteSet.set(peerId, false);
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -109,14 +143,22 @@ export class WebRTCManager {
       }
     };
 
+    pc.oniceconnectionstatechange = () => {
+      console.log(`[WebRTC - ${peerId}] ICE Connection State:`, pc.iceConnectionState);
+    };
+    
+    pc.onsignalingstatechange = () => {
+      console.log(`[WebRTC - ${peerId}] Signaling State:`, pc.signalingState);
+    };
+
     pc.onconnectionstatechange = () => {
+      console.log(`[WebRTC - ${peerId}] Connection State:`, pc.connectionState);
       this.events.onConnectionStateChange(peerId, pc.connectionState);
       if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         this.cleanupPeer(peerId);
       }
     };
 
-    // Listen for incoming data channels (when we're the receiver / Answerer side)
     pc.ondatachannel = (event) => {
       this.setupDataChannel(peerId, event.channel);
     };
@@ -129,11 +171,17 @@ export class WebRTCManager {
     this.dataChannels.set(peerId, channel);
 
     channel.onopen = () => {
+      console.log(`[DataChannel - ${peerId}] Opened`);
       this.events.onDataChannel(peerId, channel);
     };
 
     channel.onclose = () => {
+      console.log(`[DataChannel - ${peerId}] Closed`);
       this.dataChannels.delete(peerId);
+    };
+
+    channel.onerror = (error) => {
+      console.error(`[DataChannel - ${peerId}] Error:`, error);
     };
   }
 
@@ -148,6 +196,8 @@ export class WebRTCManager {
       pc.close();
       this.peers.delete(peerId);
     }
+    this.candidateQueue.delete(peerId);
+    this.isRemoteSet.delete(peerId);
   }
 
   disconnectAll() {
